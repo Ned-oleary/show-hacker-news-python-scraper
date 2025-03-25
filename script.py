@@ -1,80 +1,77 @@
-from concurrent.futures import ThreadPoolExecutor
-import requests
+import asyncio
+import aiohttp
 import csv
-import time
 
 BASE_URL = 'https://hacker-news.firebaseio.com/v0'
 OUTPUT_CSV = 'show_launch_hn_data.csv'
-
-# the HN API requires that you fetch by ID like this
-def fetch_item(item_id):
-    try:
-        resp = requests.get(f'{BASE_URL}/item/{item_id}.json', timeout=5)
-        if resp.status_code == 200:
-            return resp.json()
-    except:
-        try:
-            time.sleep(5)
-            resp = requests.get(f'{BASE_URL}/item/{item_id}.json', timeout=5)
-            if resp.status_code == 200:
-                return resp.json()
-        except:
-            print("Failed on item " + item_id)
-    return None
-
-# this is really the only way to get the most recent posts
-def get_max_item_id():
-    resp = requests.get(f'{BASE_URL}/maxitem.json')
-    if resp.status_code == 200:
-        return resp.json() # actually returns an int, fwiw
-    return None
+CONCURRENT_REQUESTS = 50
 
 def is_show_or_launch(title):
     title = title.lower()
     return title.startswith('show hn') or title.startswith('launch hn')
 
+async def fetch_item(session, item_id):
+    url = f'{BASE_URL}/item/{item_id}.json'
+    try:
+        async with session.get(url, timeout=5) as resp:
+            if resp.status == 200:
+                return await resp.json()
+    except Exception:
+        return None
 
-def scrape(target_count=1000):
-    max_item_id = get_max_item_id()
-    candidate_ids = list(range(max_item_id, max_item_id - 100000, -1))
+async def get_max_item_id(session):
+    url = f'{BASE_URL}/maxitem.json'
+    async with session.get(url, timeout=5) as resp:
+        return await resp.json()
 
+async def scrape(target_count=10_000):
     rows = []
+    all_keys = set()
 
-    def process_id(item_id):
-        item = fetch_item(item_id)
-        if not item or 'title' not in item or 'score' not in item:
-            return None
-        title = item['title']
-        if not is_show_or_launch(title):
-            return None
-        print(title)
-        item['open_source'] = 'open source' in title.lower()
-        return item
+    conn = aiohttp.TCPConnector(limit=CONCURRENT_REQUESTS)
+    async with aiohttp.ClientSession(connector=conn) as session:
+        max_id = await get_max_item_id(session)
+        candidate_ids = range(max_id, max_id - 1_000_000, -1)
 
-    with ThreadPoolExecutor(max_workers=10) as executor:
-        for item in executor.map(process_id, candidate_ids):
-            if item:
-                rows.append(item)
-                if len(rows) >= target_count:
-                    break
+        sem = asyncio.Semaphore(CONCURRENT_REQUESTS)
 
+        async def process(item_id):
+            async with sem:
+                item = await fetch_item(session, item_id)
+                if not item or 'title' not in item or 'score' not in item:
+                    return None
+                if not is_show_or_launch(item['title']):
+                    return None
+                item['open_source'] = 'open source' in item['title'].lower()
+                return item
+
+        tasks = []
+        for item_id in candidate_ids:
+            if len(rows) >= target_count:
+                break
+            tasks.append(process(item_id))
+
+            if len(tasks) >= CONCURRENT_REQUESTS * 10:
+                results = await asyncio.gather(*tasks)
+                for item in results:
+                    if item:
+                        rows.append(item)
+                        all_keys.update(item.keys())
+                        if len(rows) >= target_count:
+                            break
+                tasks = []
+
+    # Write CSV
     if not rows:
         print("No matching posts found.")
         return
 
-    all_keys = set()
-    for row in rows:
-        all_keys.update(row.keys())
-    fieldnames = list(all_keys)
-
     with open(OUTPUT_CSV, 'w', newline='', encoding='utf-8') as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer = csv.DictWriter(f, fieldnames=list(all_keys))
         writer.writeheader()
         writer.writerows(rows)
 
     print(f"Wrote {len(rows)} posts to {OUTPUT_CSV}")
 
-
-
 if __name__ == '__main__':
-    scrape()
+    asyncio.run(scrape())

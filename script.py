@@ -31,7 +31,7 @@ async def scrape(target_count=10_000):
     conn = aiohttp.TCPConnector(limit=CONCURRENT_REQUESTS)
     async with aiohttp.ClientSession(connector=conn) as session:
         max_id = await get_max_item_id(session)
-        candidate_ids = range(max_id, max_id - 1_000_000, -1)
+        candidate_ids = range(max_id, 0, -1)
 
         sem = asyncio.Semaphore(CONCURRENT_REQUESTS)
 
